@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/Clion_Project/STM32/Bare_Metal/STM32F103/LED-KK/cmake-build-debug/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -1,0 +1,20 @@
+CMakeFiles/LED-KK.elf.dir/Core/Src/sysmem.c.obj: \
+ D:\Clion_Project\STM32\Bare_Metal\STM32F103\LED-KK\Core\Src\sysmem.c \
+ d:\clion\arm\arm-none-eabi\include\errno.h \
+ d:\clion\arm\arm-none-eabi\include\sys\errno.h \
+ d:\clion\arm\arm-none-eabi\include\sys\reent.h \
+ d:\clion\arm\arm-none-eabi\include\_ansi.h \
+ d:\clion\arm\arm-none-eabi\include\newlib.h \
+ d:\clion\arm\arm-none-eabi\include\_newlib_version.h \
+ d:\clion\arm\arm-none-eabi\include\sys\config.h \
+ d:\clion\arm\arm-none-eabi\include\machine\ieeefp.h \
+ d:\clion\arm\arm-none-eabi\include\sys\features.h \
+ d:\clion\arm\lib\gcc\arm-none-eabi\10.3.1\include\stddef.h \
+ d:\clion\arm\arm-none-eabi\include\sys\_types.h \
+ d:\clion\arm\arm-none-eabi\include\machine\_types.h \
+ d:\clion\arm\arm-none-eabi\include\machine\_default_types.h \
+ d:\clion\arm\arm-none-eabi\include\sys\lock.h \
+ d:\clion\arm\lib\gcc\arm-none-eabi\10.3.1\include\stdint.h \
+ d:\clion\arm\arm-none-eabi\include\stdint.h \
+ d:\clion\arm\arm-none-eabi\include\sys\_intsup.h \
+ d:\clion\arm\arm-none-eabi\include\sys\_stdint.h

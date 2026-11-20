@@ -18,20 +18,41 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "OLED.h"
+#include <stdio.h>
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct
+{
+  uint8_t header;
+  uint8_t run;
+  uint8_t dir;
+  uint8_t step_l;
+  uint8_t step_h;
+  uint8_t check;
+} UartLedPacket_t;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define UART_LED_HEADER            0xAAU
+#define UART_LED_PACKET_SIZE       6U
+#define UART_LED_COUNT             3U
+#define UART_LED_STEP_MIN_MS       100U
+#define UART_LED_STEP_MAX_MS       2000U
+#define UART_LED_COMMAND_QUEUE_SIZE 4U
+#define UART_LED_TX_QUEUE_SIZE     4U
+#define UART_LED_TX_MESSAGE_SIZE   64U
 
 /* USER CODE END PD */
 
@@ -43,17 +64,296 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+static uint8_t led_index = 0U;
+static uint8_t running = 0U;
+static uint8_t direction = 0U;
+static uint16_t step_ms = 300U;
+static uint32_t last_step_tick = 0U;
 
+/* UART2 receive state. UART2 uses PA2 (TX) and PA3 (RX). */
+static uint8_t uart_rx_byte = 0U;
+static uint8_t uart_rx_count = 0U;
+static UartLedPacket_t uart_rx_frame;
+
+/* Complete packets are queued here by the UART interrupt. */
+static UartLedPacket_t command_queue[UART_LED_COMMAND_QUEUE_SIZE];
+static volatile uint8_t command_head = 0U;
+static volatile uint8_t command_tail = 0U;
+
+/* English feedback messages sent with HAL_UART_Transmit_IT(). */
+static char tx_message[UART_LED_TX_QUEUE_SIZE][UART_LED_TX_MESSAGE_SIZE];
+static uint16_t tx_length[UART_LED_TX_QUEUE_SIZE];
+static volatile uint8_t tx_head = 0U;
+static volatile uint8_t tx_tail = 0U;
+static volatile uint8_t tx_busy = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+static void Led_Show(uint8_t index);
+static void Oled_ShowAll(void);
+static void Key1_Task(void);
+static void Key2_Task(void);
+static uint8_t UartLed_NextIndex(uint8_t index, uint8_t size);
+static uint8_t UartLed_Checksum(const UartLedPacket_t *packet);
+static uint8_t UartLed_FrameIsValid(const UartLedPacket_t *packet);
+static void UartLed_QueueState(void);
+static void UartLed_StartTransmit(void);
+static void UartLed_StartReceive(void);
+static void UartLed_ApplyPacket(const UartLedPacket_t *packet);
+static void UartLed_Process(void);
+static void UartLed_HandleRxByte(uint8_t received);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void Led_Show(uint8_t index)
+{
+  HAL_GPIO_WritePin(GPIOA, LED_1_Pin,
+                    (index == 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LED_2_Pin,
+                    (index == 1U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LED_3_Pin,
+                    (index == 2U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void Oled_ShowAll(void)
+{
+  OLED_ShowString(1U, 1U, running ? "STATE: RUN  " : "STATE: PAUSE");
+  OLED_ShowString(2U, 1U, direction ? "DIR: REV " : "DIR: FWD ");
+  OLED_ShowString(3U, 1U, "STEP=");
+  OLED_ShowNum(3U, 6U, step_ms, 4U);
+  OLED_ShowString(3U, 10U, "ms  ");
+  OLED_ShowString(4U, 1U, "LED: ");
+  OLED_ShowNum(4U, 6U, (uint32_t)(led_index + 1U), 1U);
+}
+
+static void Key1_Task(void)
+{
+  if (HAL_GPIO_ReadPin(KEY_1_GPIO_Port, KEY_1_Pin) == GPIO_PIN_SET)
+  {
+    HAL_Delay(20U);
+    if (HAL_GPIO_ReadPin(KEY_1_GPIO_Port, KEY_1_Pin) == GPIO_PIN_SET)
+    {
+      running = running ? 0U : 1U;
+      last_step_tick = HAL_GetTick();
+      Oled_ShowAll();
+      UartLed_QueueState();
+      while (HAL_GPIO_ReadPin(KEY_1_GPIO_Port, KEY_1_Pin) == GPIO_PIN_SET)
+      {
+      }
+    }
+  }
+}
+
+static void Key2_Task(void)
+{
+  if (HAL_GPIO_ReadPin(KEY_2_GPIO_Port, KEY_2_Pin) == GPIO_PIN_SET)
+  {
+    HAL_Delay(20U);
+    if (HAL_GPIO_ReadPin(KEY_2_GPIO_Port, KEY_2_Pin) == GPIO_PIN_SET)
+    {
+      direction = direction ? 0U : 1U;
+      last_step_tick = HAL_GetTick();
+      Oled_ShowAll();
+      UartLed_QueueState();
+      while (HAL_GPIO_ReadPin(KEY_2_GPIO_Port, KEY_2_Pin) == GPIO_PIN_SET)
+      {
+      }
+    }
+  }
+}
+
+static uint8_t UartLed_NextIndex(uint8_t index, uint8_t size)
+{
+  index++;
+  if (index >= size)
+  {
+    index = 0U;
+  }
+  return index;
+}
+
+static uint8_t UartLed_Checksum(const UartLedPacket_t *packet)
+{
+  uint16_t sum = UART_LED_HEADER;
+
+  sum += (uint16_t)packet->run;
+  sum += (uint16_t)packet->dir;
+  sum += (uint16_t)packet->step_l;
+  sum += (uint16_t)packet->step_h;
+  return (uint8_t)(sum & 0xFFU);
+}
+
+static uint8_t UartLed_FrameIsValid(const UartLedPacket_t *packet)
+{
+  uint16_t requested_step;
+
+  if (packet->header != UART_LED_HEADER)
+  {
+    return 0U;
+  }
+
+  if ((packet->run > 1U) || (packet->dir > 1U))
+  {
+    return 0U;
+  }
+
+  requested_step = (uint16_t)packet->step_l |
+                   ((uint16_t)packet->step_h << 8U);
+  if ((requested_step < UART_LED_STEP_MIN_MS) ||
+      (requested_step > UART_LED_STEP_MAX_MS))
+  {
+    return 0U;
+  }
+
+  return (packet->check == UartLed_Checksum(packet)) ? 1U : 0U;
+}
+
+static void UartLed_QueueState(void)
+{
+  uint8_t next_tail;
+  int length;
+
+  next_tail = UartLed_NextIndex(tx_tail, UART_LED_TX_QUEUE_SIZE);
+  if (next_tail == tx_head)
+  {
+    return;
+  }
+
+  length = snprintf(tx_message[tx_tail],
+                    UART_LED_TX_MESSAGE_SIZE,
+                    "STATE=%s,DIR=%s,STEP=%u,LED=%u\r\n",
+                    running ? "RUN" : "PAUSE",
+                    direction ? "REV" : "FWD",
+                    (unsigned int)step_ms,
+                    (unsigned int)(led_index + 1U));
+
+  if ((length <= 0) ||
+      ((size_t)length >= (size_t)UART_LED_TX_MESSAGE_SIZE))
+  {
+    return;
+  }
+
+  tx_length[tx_tail] = (uint16_t)length;
+  tx_tail = next_tail;
+}
+
+static void UartLed_StartTransmit(void)
+{
+  if (tx_busy || (tx_head == tx_tail))
+  {
+    return;
+  }
+
+  tx_busy = 1U;
+  if (HAL_UART_Transmit_IT(&huart2,
+                           (uint8_t *)tx_message[tx_head],
+                           tx_length[tx_head]) != HAL_OK)
+  {
+    tx_busy = 0U;
+  }
+}
+
+static void UartLed_StartReceive(void)
+{
+  (void)HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1U);
+}
+
+static void UartLed_ApplyPacket(const UartLedPacket_t *packet)
+{
+  if (!UartLed_FrameIsValid(packet))
+  {
+    return;
+  }
+
+  running = packet->run;
+  direction = packet->dir;
+  step_ms = (uint16_t)packet->step_l |
+            ((uint16_t)packet->step_h << 8U);
+  last_step_tick = HAL_GetTick();
+
+  Led_Show(led_index);
+  Oled_ShowAll();
+  UartLed_QueueState();
+}
+
+static void UartLed_Process(void)
+{
+  uint8_t next_head;
+  uint32_t now;
+
+  while (command_head != command_tail)
+  {
+    UartLedPacket_t packet = command_queue[command_head];
+
+    next_head = UartLed_NextIndex(command_head,
+                                  UART_LED_COMMAND_QUEUE_SIZE);
+    command_head = next_head;
+    UartLed_ApplyPacket(&packet);
+  }
+
+  now = HAL_GetTick();
+  if (running && ((uint32_t)(now - last_step_tick) >= step_ms))
+  {
+    last_step_tick += step_ms;
+
+    if (direction == 0U)
+    {
+      led_index = UartLed_NextIndex(led_index, UART_LED_COUNT);
+    }
+    else
+    {
+      led_index = (led_index == 0U)
+                      ? (UART_LED_COUNT - 1U)
+                      : (uint8_t)(led_index - 1U);
+    }
+
+    Led_Show(led_index);
+    OLED_ShowNum(4U, 6U, (uint32_t)(led_index + 1U), 1U);
+  }
+
+  UartLed_StartTransmit();
+}
+
+static void UartLed_HandleRxByte(uint8_t received)
+{
+  uint8_t *frame_bytes = (uint8_t *)&uart_rx_frame;
+
+  if (uart_rx_count == 0U)
+  {
+    if (received == UART_LED_HEADER)
+    {
+      frame_bytes[0] = received;
+      uart_rx_count = 1U;
+    }
+    return;
+  }
+
+  frame_bytes[uart_rx_count] = received;
+  uart_rx_count++;
+
+  if (uart_rx_count == UART_LED_PACKET_SIZE)
+  {
+    uint8_t next_tail = UartLed_NextIndex(command_tail,
+                                          UART_LED_COMMAND_QUEUE_SIZE);
+
+    /*
+     * Header and checksum are checked in the interrupt. Field values are
+     * checked again before the command changes any application state.
+     */
+    if ((next_tail != command_head) &&
+        (uart_rx_frame.header == UART_LED_HEADER) &&
+        (uart_rx_frame.check == UartLed_Checksum(&uart_rx_frame)))
+    {
+      command_queue[command_tail] = uart_rx_frame;
+      command_tail = next_tail;
+    }
+
+    uart_rx_count = 0U;
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -86,42 +386,30 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  /* OLED.c uses software I2C on PB6 (SCL) and PB7 (SDA). */
+  OLED_Init();
 
+  Led_Show(led_index);
+  Oled_ShowAll();
+  last_step_tick = HAL_GetTick();
+  UartLed_StartReceive();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    HAL_GPIO_WritePin(LED_1_GPIO_Port,LED_1_Pin,GPIO_PIN_SET);
-    HAL_GPIO_WritePin(LED_2_GPIO_Port,LED_2_Pin,GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_3_GPIO_Port,LED_3_Pin,GPIO_PIN_RESET);
-    HAL_Delay(500);
-    HAL_INIT
-    HAL_GPIO_WritePin(LED_1_GPIO_Port,LED_1_Pin,GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_2_GPIO_Port,LED_2_Pin,GPIO_PIN_SET);
-    HAL_GPIO_WritePin(LED_3_GPIO_Port,LED_3_Pin,GPIO_PIN_RESET);
-    HAL_Delay(500);
-    HAL_GPIO_WritePin(LED_1_GPIO_Port,LED_1_Pin,GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_2_GPIO_Port,LED_2_Pin,GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_3_GPIO_Port,LED_3_Pin,GPIO_PIN_SET);
-    HAL_Delay(500);
-    HAL_GPIO_WritePin(LED_1_GPIO_Port,LED_1_Pin,GPIO_PIN_SET);
-    HAL_GPIO_WritePin(LED_2_GPIO_Port,LED_2_Pin,GPIO_PIN_SET);
-    HAL_GPIO_WritePin(LED_3_GPIO_Port,LED_3_Pin,GPIO_PIN_SET);
-    HAL_Delay(500);
-    HAL_GPIO_WritePin(LED_1_GPIO_Port,LED_1_Pin,GPIO_PIN_SET);
-    HAL_GPIO_WritePin(LED_2_GPIO_Port,LED_2_Pin,GPIO_PIN_SET);
-    HAL_GPIO_WritePin(LED_3_GPIO_Port,LED_3_Pin,GPIO_PIN_RESET);
-    HAL_Delay(500);
-    HAL_GPIO_WritePin(LED_1_GPIO_Port,LED_1_Pin,GPIO_PIN_SET);
-    HAL_GPIO_WritePin(LED_2_GPIO_Port,LED_2_Pin,GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_3_GPIO_Port,LED_3_Pin,GPIO_PIN_RESET);
-    HAL_Delay(500);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    Key1_Task();
+    Key2_Task();
+    UartLed_Process();
+
+    HAL_Delay(2U);
   }
   /* USER CODE END 3 */
 }
@@ -166,6 +454,37 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    UartLed_HandleRxByte(uart_rx_byte);
+    UartLed_StartReceive();
+  }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    if (tx_head != tx_tail)
+    {
+      tx_head = UartLed_NextIndex(tx_head, UART_LED_TX_QUEUE_SIZE);
+    }
+    tx_busy = 0U;
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    uart_rx_count = 0U;
+    tx_busy = 0U;
+    (void)HAL_UART_Abort(&huart2);
+    UartLed_StartReceive();
+  }
+}
 
 /* USER CODE END 4 */
 
